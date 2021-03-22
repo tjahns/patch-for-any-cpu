@@ -13,10 +13,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
- * ---------------------------------------------------
- * --- Uncripple Intel binaries for AMD processors ---
- * ---------------------------------------------------
- *
  * It removes the `cmp/cmpl' instructions near a `cpuid' one used to test
  * the vendor string of the CPU. Works on ELF binaries and shared libraries.
  *
@@ -67,7 +63,7 @@ struct {
 
 void print_help(void)
 {
-	printf("Usage: patch-AuthenticAMD [-e] [-c] [-d <bytes_distance>] [-a] [-r] [-s <vendor_string>] [-v] <executable_to_patch> | -h\n\n"
+	printf("Usage: patch-for-any-cpu [-e] [-c] [-d <bytes_distance>] [-a] [-r] [-s <vendor_string>] [-v] <executable_to_patch> | -h\n\n"
 			"The vendor string must be 12 characters long. The executable to patch must be an\n"
 			"ELF program or an ELF share library.\n\n"
 			"-e: don't analyze the ELF structure, just do the substitutions in all the binary\n"
@@ -361,3 +357,12 @@ int main(int argc, char *argv[])
 
 	return 0;
 }
+
+/**
+ * Local Variables:
+ * indent-tabs-mode: t
+ * tab-width: 4
+ * c-basic-offset: 4
+ * c-file-style: "k&r"
+ * End:
+ */
