@@ -1,6 +1,7 @@
 #CFLAGS = -g -std=c99 -Wall -pedantic
 #LDFLAGS = -lelf
-CFLAGS = -std=c99 -Wall -pedantic
+CC = gcc
+CFLAGS = -std=gnu99 -Wall -pedantic -Wextra -O2 -g
 LDFLAGS = -lelf
 PREFIX = /usr/local
 

@@ -16,10 +16,14 @@
  * It removes the `cmp/cmpl' instructions near a `cpuid' one used to test
  * the vendor string of the CPU. Works on ELF binaries and shared libraries.
  *
- * Tested with Intel C++ Compiler 10.x and 11.x. It might also work with
+ * Tested with Intel C Compiler 16.0.8.266. It might also work with
  * next versions of the compiler.
  */
 
+#define _GNU_SOURCE
+
+#include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -38,16 +42,23 @@
 #define PRINT_ELF_ERRNO() print_elf_errno(__LINE__)
 
 /* The compiler always uses a CPUID instruction before the string comparison. */
-#define CPUID_BYTES_DISTANCE 200
+#define CPUID_BYTES_DISTANCE 2048
 
 /* The instruction used to test the CPU string depends on the version of the compiler:
- * - Until ICC 10.x the instruction was `cmp $value,%eax' with opcode `0x3d, value'.
- * - From ICC 11.x and onwards the instruction is `cmpl $value,disp(%rbp)' with opcode
- *   `0x81, 0x7d, disp, value'.
+ * - Until ICC 10.x the instruction was `cmp $value,%eax' with opcode
+ *   `0x3d, value'.
+ *
+ * - From ICC 11.x and onwards the instruction is `cmpl $value,disp(%rbp)'
+ *   with opcode `0x81, 0x7d, disp, value'.
+ *
+ * - For at least 16.0.x the instruction becomes `cmpl $value,disp(%rsp)'
+ *   with opcode `0x81, 0x7c, disp, value'
  */
-#define CMP_OPCODE   0x3d
-#define CMPL_OPCODE1 0x81
-#define CMPL_OPCODE2 0x7d
+enum {
+	CMP_OPCODE = 0x3d,
+	CMPL_OPCODE1 = 0x81,
+	CMPL_OPCODE2 = 0x7d,
+};
 
 char *PROGRAM_NAME;
 
@@ -57,16 +68,15 @@ struct {
 	bool read_only;
 	bool replace_complete_string;
 	bool patch_all_sections;
-	char *vendor_string;
 	int cpuid_bytes_distance;
 } options;
 
 void print_help(void)
 {
-	printf("Usage: patch-for-any-cpu [-e] [-c] [-d <bytes_distance>] [-a] [-r] [-s <vendor_string>] [-v] <executable_to_patch> | -h\n\n"
-			"The vendor string must be 12 characters long. The executable to patch must be an\n"
-			"ELF program or an ELF share library.\n\n"
-			"-e: don't analyze the ELF structure, just do the substitutions in all the binary\n"
+	printf("Usage: patch-for-any-cpu [-e] [-c] [-d <bytes_distance>] [-a] [-r] [-v] <executable_to_patch> | -h\n\n"
+			"The executable to patch must be an\n"
+			"ELF program or an ELF shared library.\n\n"
+			"-e:\tdon't analyze the ELF structure, just do the substitutions in all the binary\n"
 			"\tfile. By default the substitutions are done only in executable sections of the binary.\n"
 			"-c: don't replace the complete vendor string, just any partial occurrence of it.\n"
 			"-d: set the max number of bytes between a CPUID instruction and a substitution.\n"
@@ -74,7 +84,6 @@ void print_help(void)
 			"-a: patch all sections of the ELF executable, even if these sections aren't\n"
 			"\tmachine code. By default only patch executable sections.\n"
 			"-r: work on read-only mode. Try to use in conjunction with the \"-v\" option.\n"
-			"-s: set the vendor string. The default is \"AuthenticAMD\".\n"
 			"-v: give verbose output.\n"
 			"-h: print this help.\n", CPUID_BYTES_DISTANCE);
 }
@@ -111,90 +120,103 @@ void print_elf_errno(int line_number)
  * has each time is called the real start address of the section in the executable
  * when this is loaded to memory by the operating system.
  */
-int replace_vendor_string(unsigned char *data, int data_size, unsigned char *start_address)
+int nop_patch(unsigned char *data, GElf_Xword data_size, unsigned char *start_address)
 {
-	char replace_words[3][4], search_words[3][4] = {"Genu", "ineI" ,"ntel"};
-	int substitutions = 0, next_word = 0, last_substitution = 0;
-	int cpuid_occurrence = -1, i, j;
+	int substitutions = 0;
+	size_t cpuid_occurrence = SSIZE_MAX;
 
-	for (j = 0, i = 0; j < 3 && i < 12; j++, i += 4)
-		memcpy(replace_words[j], options.vendor_string + i, 4);
+	size_t i = 0;
+	while (i < data_size) {
+		unsigned char *p;
+		static const unsigned char cpuid_bytes[2] = { 0x0f, 0xa2 };
+		p = memmem(data+i, data_size - i, cpuid_bytes, sizeof(cpuid_bytes));
+		if (!p || p == data+data_size-2)
+			goto end_of_cpuid_search;
+		i = (size_t)(p - data);
+		cpuid_occurrence = i;
+		if (options.verbose)
+			printf("\t---> CPUID instruction found at %p\n",
+				   start_address + cpuid_occurrence);
+		i+=2;
 
-	for (i = 0; i < data_size; i++) {
-		if (data[i] == 0x0f && i < data_size - 1 && data[i + 1] == 0xa2) {
-			cpuid_occurrence = i;
-			if (options.verbose)
-				printf("\t---> CPUID instruction found at %p\n", start_address + i);
-			i++;
-		}
-
-		if ((i < data_size - 4 && data[i] == CMP_OPCODE) ||                                              /* ICC <= 10.x */
-				(i < data_size - 7 && data[i] == CMPL_OPCODE1 && data[i + 1] == CMPL_OPCODE2)) { /* ICC >= 11.x */
-			i += (data[i] == CMP_OPCODE) ? 1 : 3;
-			for (j = 0; j < 3; j++) {
-				if (!memcmp(data + i, search_words[j], 4)) {
-					if ((options.replace_complete_string && j == next_word) ||
-							!options.replace_complete_string) {
-						if (!options.read_only) {
-							if (options.cpuid_bytes_distance == 0 || (cpuid_occurrence != -1 &&
-										i - cpuid_occurrence <= options.cpuid_bytes_distance)) {
-								memcpy(data + i, replace_words[j], 4);
-								last_substitution = i;
-							} else {
-								printf("\t---> Warning: possible substitution at %p but not CPUID\n"
-										"\t\tinstruction near it, so not replaced\n",
-										start_address + i);
-								break;
-							}
-						}
-
-						if (options.replace_complete_string && next_word == 2) {
-							substitutions++;
-							if (options.verbose)
-								printf("\t===> Complete substitution at %p\n",
-										start_address + i);
-						} else if (!options.replace_complete_string) {
-							substitutions++;
-							if (options.verbose)
-								printf("\t===> Partial substitution at %p\n",
-										start_address + i);
-						}
-						next_word = (1 + next_word) % 3;
-						i += 4;
-						break;
-					} else {
-						printf("\t---> Warning: partial substitution at %p, but not replaced\n",
-								start_address + i);
-						break;
-					}
-				}
+		/*
+		 * In a typical binary, the following 4 byte sequences
+		 * static const char search_words[3][4] = {"Genu", "ineI" ,"ntel"};
+		 * are compared against the result of cpuid by instructions like
+		 * 0x81, 0x7c, 0x24, 0xfc, 0x69, 0x6e, 0x65, 0x49
+		 * which translates to
+		 * cmpl   $0x49656e69,-0x4(%rsp)
+		 * this compare is followed by a conditional jump
+		 * to disable that superfluous check, both are replaced by a nop
+		 */
+		uint64_t mask_cmpl = UINT64_C(0xffffffff0000ffff),
+			ptrn_cmpl_ineI = UINT64_C(0x49656e6900007c81),
+			ptrn_cmpl_Genu = UINT64_C(0x756e654700007c81),
+			ptrn_cmpl_ntel = UINT64_C(0x6c65746e00007c81),
+			mask_cmp =      UINT64_C(0x000000ffffffffff),
+			ptrn_cmp_ineI = UINT64_C(0x00000049656e693d),
+			ptrn_cmp_Genu = UINT64_C(0x000000756e65473d),
+			ptrn_cmp_ntel = UINT64_C(0x0000006c65746e3d);
+		/* position at maximal distance from cpuid */
+		size_t m = i + options.cpuid_bytes_distance < data_size
+			? i + options.cpuid_bytes_distance : data_size - 1;
+		uint64_t accum = 0;
+		for (size_t j = m; j >= i; --j) {
+			accum = (accum << 8) | data[j];
+			static const unsigned char
+				nop10[] = { 0x0f, 0x1f, 0x44, 0x00, 0x00,
+							0x0f, 0x1f, 0x44, 0x00, 0x00 },
+				nop7[] = { 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66, 0x90 };
+			const unsigned char *nop_src;
+			size_t nop_size, cmp_size;
+			if ((accum & mask_cmpl) == ptrn_cmpl_ineI
+				|| (accum & mask_cmpl) == ptrn_cmpl_Genu
+				|| (accum & mask_cmpl) == ptrn_cmpl_ntel) {
+				nop_src = nop10;
+				nop_size = sizeof(nop10);
+				cmp_size = 8;
+			} else if ((accum & mask_cmp) == ptrn_cmp_ineI
+					   || (accum & mask_cmp) == ptrn_cmp_Genu
+					   || (accum & mask_cmp) == ptrn_cmp_ntel) {
+				nop_src = nop7;
+				nop_size = sizeof(nop7);
+				cmp_size = 5;
+			} else {
+				/* jump to next byte if no match is found */
+				continue;
+			}
+			if (data[j+cmp_size] != 0x75)
+				continue;
+			if (options.verbose) {
+				printf("\t---> Patching out test instructions at %p\n",
+					   start_address + j);
+				char sbuf[nop_size*6+2];
+				for (size_t k = 0; k < nop_size; ++k)
+					sprintf(sbuf+k*6, "%s0x%02x", k > 0 ? ", " : "\t\t",
+							data[j+k]);
+				sbuf[nop_size*6] = '\n', sbuf[nop_size*6+1] = '\0';
+				fputs(sbuf, stdout);
+			}
+			if (!options.read_only) {
+				/* replace cmpl/cmp and jne following it */
+				assert(data_size-j >= nop_size);
+				++substitutions;
+				memcpy(data+j, nop_src, nop_size);
 			}
 		}
 	}
-
-	if (options.replace_complete_string && next_word != 0) {
-		printf("\t---> Warning: last complete substitution at %p was partially made\n",
-				start_address + last_substitution);
-		if (!options.read_only)
-			printf("\t\t(no changes will be written in this data block)\n");
-	}
-
+end_of_cpuid_search:
 	return substitutions;
 }
 
 int analyze_elf_binary(int file_descriptor, unsigned char *file_data)
 {
-	Elf *elf_handle;
-	GElf_Ehdr elf_executable_header;
-	Elf_Scn *section;
-	GElf_Shdr section_header;
-	char *section_name;
-	int replacements;
-
 	if (elf_version(EV_CURRENT) == EV_NONE)
 		PRINT_ELF_ERRNO();
-	if ((elf_handle = elf_begin(file_descriptor, ELF_C_READ, NULL)) == NULL)
+	Elf *elf_handle = elf_begin(file_descriptor, ELF_C_READ, NULL);
+	if (!elf_handle)
 		PRINT_ELF_ERRNO();
+	GElf_Ehdr elf_executable_header;
 	if (gelf_getehdr(elf_handle, &elf_executable_header) == NULL)
 		PRINT_ELF_ERRNO();
 
@@ -224,14 +246,17 @@ int analyze_elf_binary(int file_descriptor, unsigned char *file_data)
 			break;
 	}
 
-	replacements = 0;
-	section = NULL;
+	int replacements = 0;
+	Elf_Scn *section = NULL;
 	while ((section = elf_nextscn(elf_handle, section)) != NULL) {
+		GElf_Shdr section_header;
 		if (gelf_getshdr(section, &section_header) != &section_header)
 			PRINT_ELF_ERRNO();
 
-		if ((section_name = elf_strptr(elf_handle, elf_executable_header.e_shstrndx,
-						section_header.sh_name)) == NULL)
+		const char *section_name
+			= elf_strptr(elf_handle, elf_executable_header.e_shstrndx,
+						 section_header.sh_name);
+		if (!section_name)
 			PRINT_ELF_ERRNO();
 
 		if (options.verbose && !(section_header.sh_flags & SHF_EXECINSTR))
@@ -242,13 +267,13 @@ int analyze_elf_binary(int file_descriptor, unsigned char *file_data)
 		if (section_header.sh_flags & SHF_EXECINSTR || options.patch_all_sections) {
 			/* Avoid the `.bss' section, it doesn't exist in the binary file. */
 			if (strcmp(section_name, ".bss")) {
-				replacements += replace_vendor_string(file_data + section_header.sh_offset,
+				replacements += nop_patch(file_data + section_header.sh_offset,
 						section_header.sh_size,
 						(unsigned char *) section_header.sh_addr);
 			}
 		}
 	}
-	PRINT_ELF_ERRNO(); /* If there isn't elf_errno set, nothing will happend. */
+	PRINT_ELF_ERRNO(); /* If there isn't elf_errno set, nothing will happen. */
 
 	elf_end(elf_handle);
 
@@ -272,7 +297,6 @@ int main(int argc, char *argv[])
 	options.read_only = false;
 	options.replace_complete_string = true;
 	options.patch_all_sections = false;
-	options.vendor_string = "AuthenticAMD";
 	options.cpuid_bytes_distance = CPUID_BYTES_DISTANCE;
 
 	while ((option = getopt(argc, argv, "ecd:ars:vh")) != -1) {
@@ -291,13 +315,6 @@ int main(int argc, char *argv[])
 				break;
 			case 'r':
 				options.read_only = true;
-				break;
-			case 's':
-				if (strlen(optarg) != 12) {
-					PRINT_ERROR_MESSAGE("the vendor string must be 12 characters long", true);
-					break;
-				}
-				options.vendor_string = optarg;
 				break;
 			case 'v':
 				options.verbose = true;
@@ -334,7 +351,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (options.analyze_elf) {
-		/* 
+		/*
 		 * Here we use `libelf' to look at the ELF structure to find the executable
 		 * sections where the machine code is located (sections like `.text'). Then
 		 * we do the substitutions only on that sections through the mmaped file.
@@ -347,7 +364,7 @@ int main(int argc, char *argv[])
 		 * Here we just mmap the file and search in all its content in order to do
 		 * the substitutions.
 		 */
-		replacements = replace_vendor_string(file_data, file_information.st_size, NULL);
+		replacements = nop_patch(file_data, file_information.st_size, NULL);
 	}
 
 	if (options.verbose && !options.read_only && replacements)
